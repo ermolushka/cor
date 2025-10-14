@@ -144,7 +144,7 @@ fn child(args: &[String]) {
 
         // Step 10: Remove the oldroot directory now that it's unmounted
         // This cleans up the temporary mount point we created earlier
-        libc::remove(b"/oldroot\0".as_ptr() as *const libc::c_char);
+        libc::rmdir(b"/oldroot\0".as_ptr() as *const libc::c_char);
     }
 
     // Step 11: Execute the user's command inside the container
