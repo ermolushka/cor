@@ -126,16 +126,30 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // This function runs inside the new UTS and mount namespaces created by run()
     // It sets up an isolated container environment with its own hostname and filesystem root
     unsafe {
-        // Step 1: Set a custom hostname for this container
+        // Step 1: Make all mounts in this namespace private FIRST
+        // MS_PRIVATE prevents mount/unmount events from propagating to other namespaces
+        // This MUST be done before any other mounts to prevent leaking to the host
+        // MS_REC applies recursively to all mount points in the namespace
+        let result = libc::mount(
+            ptr::null(),
+            b"/\0".as_ptr() as *const libc::c_char,
+            ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            ptr::null(),
+        );
+        check_libc_result(result, "mount (private)")?;
+
+        // Step 2: Set a custom hostname for this container
         // This only affects the UTS namespace, not the host system
         let hostname = b"container\0";
         let result =
             libc::sethostname(hostname.as_ptr() as *const libc::c_char, hostname.len() - 1);
         check_libc_result(result, "sethostname")?;
 
-        // Step 2: Prepare for pivot_root by bind mounting the new root onto itself
+        // Step 3: Prepare for pivot_root by bind mounting the new root onto itself
         // This is required because pivot_root needs the new_root to be a mount point
         // MS_BIND creates a bind mount, MS_REC makes it recursive for all subdirectories
+        // Now that we've set MS_PRIVATE, this mount won't propagate to the host
         let result = libc::mount(
             b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char,
             b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char,
@@ -145,25 +159,13 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         );
         check_libc_result(result, "mount (bind rootfs)")?;
 
-        // Step 3: Create a directory to temporarily hold the old root filesystem
+        // Step 4: Create a directory to temporarily hold the old root filesystem
         // After pivot_root, the old root will be moved here so we can unmount it
         let result = libc::mkdir(
             b"/home/abc/Documents/cor/rootfs/oldroot\0".as_ptr() as *const libc::c_char,
             0o700,
         );
         check_libc_result(result, "mkdir (oldroot)")?;
-
-        // Step 4: Make all mounts in this namespace private
-        // MS_PRIVATE prevents mount/unmount events from propagating to other namespaces
-        // This ensures container filesystem changes don't affect the host
-        let result = libc::mount(
-            ptr::null(),
-            b"/\0".as_ptr() as *const libc::c_char,
-            ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            ptr::null(),
-        );
-        check_libc_result(result, "mount (private)")?;
 
         // Step 5: Change to the new root directory (required for pivot_root)
         let result =
