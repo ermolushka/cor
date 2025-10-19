@@ -8,3 +8,6 @@ sudo debootstrap --variant=minbase jammy ./rootfs http://archive.ubuntu.com/ubun
 
 sudo ./target/release/cor run /bin/bash
 ```
+
+## TODO
+- implement zombie reaping for CLONE_NEWPID

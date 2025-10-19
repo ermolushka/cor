@@ -1,8 +1,11 @@
+// Import traits and types for Unix-specific process spawning
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::ptr;
 
 /// Helper function to check libc call results and convert to Result
+/// Takes a libc return value (0 = success, non-zero = error) and operation name
+/// Returns Ok(()) on success, Err with last OS error on failure
 fn check_libc_result(result: i32, operation: &str) -> Result<(), std::io::Error> {
     if result != 0 {
         let err = std::io::Error::last_os_error();
@@ -14,9 +17,12 @@ fn check_libc_result(result: i32, operation: &str) -> Result<(), std::io::Error>
     }
 }
 
+/// Main entry point for the container runtime
+/// Parses command-line arguments and dispatches to run() or child() functions
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Dispatch to appropriate handler based on first argument
     let result = match args.get(1).map(|s| s.as_str()) {
         Some("run") => run(&args[2..]),
         Some("child") => child(&args[2..]),
@@ -26,12 +32,16 @@ fn main() {
         }
     };
 
+    // Handle any errors from run() or child() by printing and exiting
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
+/// The "run" function - creates new namespaces and spawns the child process
+/// This is called when user runs: mycontainer run <command>
+/// It creates UTS, Mount, and PID namespaces before spawning the child
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // It may be tricky initially but what it does:
     // - /proc/self/exe run /bin/bash
@@ -39,12 +49,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // - within new namespace, it runs /proc/self/exe child /bin/bash
     // - which inside sets a new hostname
     unsafe {
+        // Execute /proc/self/exe (this same binary) with "child" argument
+        // This creates a new process that will run the child() function
         Command::new("/proc/self/exe")
             .arg("child")
             .args(args)
             .pre_exec(|| {
-                // Clone with UTS namespace
-                let result = libc::unshare(libc::CLONE_NEWUTS | libc::CLONE_NEWNS);
+                // Clone with UTS namespace for hostname isolation
+                // CLONE_NEWNS for mount namespace (filesystem isolation)
+                // CLONE_NEWPID for PID namespace (process isolation)
+                let result =
+                    libc::unshare(libc::CLONE_NEWUTS | libc::CLONE_NEWNS | libc::CLONE_NEWPID);
                 if result != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -57,8 +72,56 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The "child" function - sets up the isolated container environment
+/// This runs inside the new namespaces created by run()
+/// It performs all container setup: hostname, filesystem pivot, /proc mount, etc.
 fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     println!("Running {:?} as PID {}", args, std::process::id());
+
+    //  This process gets PID 1 in the new namespace, but it's already running the child() function.
+    // If it tries to do the container setup (pivot_root, mount /proc, etc.), it might be too late or in
+    // the wrong state
+
+    // Fork one more time to truly enter the PID namespace
+    // The process that calls unshare(CLONE_NEWPID) doesn't enter the namespace itself
+    // Only its children do. So we need to fork again and let the child do the setup.
+    // The process that calls unshare(CLONE_NEWPID) has already initialized its process
+    // state before creating the namespace. It needs a "fresh start" process that's
+    // born inside the new namespace to properly be PID 1.
+
+    // New process will have PID 2. When the parent (PID 1) exits, the child effectively
+    // becomes the namespace's init process with responsibilities of PID 1
+
+    // Fork to create a process that is truly born inside the PID namespace
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            // Fork failed - return the error
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        // What's happening:
+        // 1. Parent (child() PID 1) waits for child (PID 2) to complete all container setup
+        // 2. WIFEXITED(status) checks if child exited normally
+        // 3. WEXITSTATUS(status) extracts the exit code
+        // 4. Parent exits with same code as child (propagates errors)
+        if pid > 0 {
+            // Parent: wait for child to complete all container setup and execution
+            let mut status: i32 = 0;
+            libc::waitpid(pid, &mut status, 0); // Block until child exits
+
+            // Exit with the same status as the child to propagate exit codes
+            std::process::exit(if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) // Normal exit - use child's exit code
+            } else {
+                1 // Abnormal exit (signal, etc.) - exit with error
+            });
+        }
+
+        // Child continues here - NOW we're truly PID 1 in the new namespace!
+        // This forked child process can now properly set up the container environment
+        println!("After fork, PID is now: {}", std::process::id());
+    }
 
     // This function runs inside the new UTS and mount namespaces created by run()
     // It sets up an isolated container environment with its own hostname and filesystem root
@@ -66,7 +129,8 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // Step 1: Set a custom hostname for this container
         // This only affects the UTS namespace, not the host system
         let hostname = b"container\0";
-        let result = libc::sethostname(hostname.as_ptr() as *const libc::c_char, hostname.len() - 1);
+        let result =
+            libc::sethostname(hostname.as_ptr() as *const libc::c_char, hostname.len() - 1);
         check_libc_result(result, "sethostname")?;
 
         // Step 2: Prepare for pivot_root by bind mounting the new root onto itself
@@ -102,7 +166,8 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         check_libc_result(result, "mount (private)")?;
 
         // Step 5: Change to the new root directory (required for pivot_root)
-        let result = libc::chdir(b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char);
+        let result =
+            libc::chdir(b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char);
         check_libc_result(result, "chdir (to rootfs)")?;
 
         // Step 6: Pivot the root filesystem
