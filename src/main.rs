@@ -41,7 +41,7 @@ fn main() {
 
 /// The "run" function - creates new namespaces and spawns the child process
 /// This is called when user runs: mycontainer run <command>
-/// It creates UTS, Mount, and PID namespaces before spawning the child
+/// It creates UTS, Mount, PID, and Network namespaces before spawning the child
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // It may be tricky initially but what it does:
     // - /proc/self/exe run /bin/bash
@@ -51,22 +51,54 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         // Execute /proc/self/exe (this same binary) with "child" argument
         // This creates a new process that will run the child() function
-        Command::new("/proc/self/exe")
+        let mut child_process = Command::new("/proc/self/exe")
             .arg("child")
             .args(args)
             .pre_exec(|| {
                 // Clone with UTS namespace for hostname isolation
                 // CLONE_NEWNS for mount namespace (filesystem isolation)
                 // CLONE_NEWPID for PID namespace (process isolation)
-                let result =
-                    libc::unshare(libc::CLONE_NEWUTS | libc::CLONE_NEWNS | libc::CLONE_NEWPID);
+                // CLONE_NEWNET for network namespace (network isolation)
+                let result = libc::unshare(
+                    libc::CLONE_NEWUTS
+                        | libc::CLONE_NEWNS
+                        | libc::CLONE_NEWPID
+                        | libc::CLONE_NEWNET,
+                );
                 if result != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             })
-            .status() // spins up a new process for child() with /proc/self/exe child /bin/bash
-            .map_err(|e| format!("Failed to run child: {}", e))?;
+            .spawn() // spawn the child process and get its PID
+            .map_err(|e| format!("Failed to spawn child: {}", e))?;
+
+        // Get the child process PID for network setup
+        let child_pid = child_process.id();
+        println!("Child process PID: {}", child_pid);
+
+        // Execute network setup script with the child PID
+        let network_setup_result = Command::new("/home/abc/Documents/cor/setup-network.sh")
+            .arg(child_pid.to_string())
+            .status();
+
+        match network_setup_result {
+            Ok(status) => {
+                if status.success() {
+                    println!("Network setup completed successfully");
+                } else {
+                    eprintln!("Network setup failed with exit code: {:?}", status.code());
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to execute network setup script: {}", e);
+            }
+        }
+
+        // Wait for the child process to complete
+        child_process
+            .wait()
+            .map_err(|e| format!("Failed to wait for child: {}", e))?;
     }
 
     Ok(())
@@ -215,9 +247,16 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         check_libc_result(result, "rmdir (oldroot)")?;
     }
 
-    // Step 11: Execute the user's command inside the container
+    // Step 11: Configure DNS resolution
+    // Write DNS configuration to /etc/resolv.conf for internet connectivity
+    let dns_config = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+    std::fs::write("/etc/resolv.conf", dns_config)
+        .map_err(|e| format!("Failed to write DNS config: {}", e))?;
+    println!("DNS configuration written to /etc/resolv.conf");
+
+    // Step 12: Execute the user's command inside the container
     // At this point, the container environment is fully set up with:
-    // - Custom hostname, isolated root filesystem, and its own /proc
+    // - Custom hostname, isolated root filesystem, its own /proc, and DNS configuration
     Command::new(&args[0])
         .args(&args[1..])
         .status()

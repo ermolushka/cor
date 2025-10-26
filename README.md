@@ -7,6 +7,8 @@ sudo debootstrap --variant=minbase jammy ./rootfs http://archive.ubuntu.com/ubun
 
 
 sudo ./target/release/cor run /bin/bash
+
+apt update && apt install -y iproute2 net-tools iputils-ping
 ```
 
 ## TODO
