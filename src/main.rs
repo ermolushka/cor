@@ -1,21 +1,13 @@
 // Import traits and types for Unix-specific process spawning
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::ptr;
 
-/// Helper function to check libc call results and convert to Result
-/// Takes a libc return value (0 = success, non-zero = error) and operation name
-/// Returns Ok(()) on success, Err with last OS error on failure
-fn check_libc_result(result: i32, operation: &str) -> Result<(), std::io::Error> {
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        eprintln!("{} failed: {}", operation, err);
-        Err(err)
-    } else {
-        println!("{} successful", operation);
-        Ok(())
-    }
-}
+mod cgroups;
+mod filesystem;
+mod namespace;
+mod network;
+
+use cgroups::Cgroup;
 
 /// Main entry point for the container runtime
 /// Parses command-line arguments and dispatches to run() or child() functions
@@ -48,28 +40,18 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // - before starting child, it calls pre_exec and clone with UTS namespace
     // - within new namespace, it runs /proc/self/exe child /bin/bash
     // - which inside sets a new hostname
+
+    // Generate a unique cgroup name based on timestamp to avoid conflicts
+    let cgroup_name = format!("mycontainer-{}", std::process::id());
+
     unsafe {
         // Execute /proc/self/exe (this same binary) with "child" argument
         // This creates a new process that will run the child() function
         let mut child_process = Command::new("/proc/self/exe")
             .arg("child")
             .args(args)
-            .pre_exec(|| {
-                // Clone with UTS namespace for hostname isolation
-                // CLONE_NEWNS for mount namespace (filesystem isolation)
-                // CLONE_NEWPID for PID namespace (process isolation)
-                // CLONE_NEWNET for network namespace (network isolation)
-                let result = libc::unshare(
-                    libc::CLONE_NEWUTS
-                        | libc::CLONE_NEWNS
-                        | libc::CLONE_NEWPID
-                        | libc::CLONE_NEWNET,
-                );
-                if result != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            })
+            .env("CGROUP_NAME", &cgroup_name)
+            .pre_exec(|| namespace::create_namespaces())
             .spawn() // spawn the child process and get its PID
             .map_err(|e| format!("Failed to spawn child: {}", e))?;
 
@@ -77,23 +59,29 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let child_pid = child_process.id();
         println!("Child process PID: {}", child_pid);
 
-        // Execute network setup script with the child PID
-        let network_setup_result = Command::new("/home/abc/Documents/cor/setup-network.sh")
-            .arg(child_pid.to_string())
-            .status();
-
-        match network_setup_result {
-            Ok(status) => {
-                if status.success() {
-                    println!("Network setup completed successfully");
-                } else {
-                    eprintln!("Network setup failed with exit code: {:?}", status.code());
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to execute network setup script: {}", e);
-            }
+        // Create and configure cgroup
+        // Note: We don't add child_pid here - it just waits and does nothing
+        // The grandchild (forked process) will add itself to the cgroup
+        let cgroup = Cgroup::new(&cgroup_name);
+        let cgroups_memory_limit_result = cgroup.set_memory_limits(100 * 1024 * 1024); // 100 MB
+        match cgroups_memory_limit_result {
+            Ok(_) => println!("Set memory limit for cgroup {}", cgroup_name),
+            Err(e) => eprintln!("Failed to set memory limit: {}", e),
         }
+
+        let cgroup_cpu_limits_result = cgroup.set_cpu_limits(50000, 100000); // 50% CPU
+        match cgroup_cpu_limits_result {
+            Ok(_) => println!("Set CPU limit for cgroup {}", cgroup_name),
+            Err(e) => eprintln!("Failed to set CPU limit: {}", e),
+        }
+        let cgroup_pid_limit_result = cgroup.set_pid_limit(&10); // max 10 processes
+        match cgroup_pid_limit_result {
+            Ok(_) => println!("Set PID limit for cgroup {}", cgroup_name),
+            Err(e) => eprintln!("Failed to set PID limit: {}", e),
+        }
+
+        // Execute network setup script with the child PID
+        let _ = network::setup_network(child_pid, "/home/abc/Documents/cor/setup-network.sh");
 
         // Wait for the child process to complete
         child_process
@@ -125,134 +113,37 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // becomes the namespace's init process with responsibilities of PID 1
 
     // Fork to create a process that is truly born inside the PID namespace
-    unsafe {
-        let pid = libc::fork();
-        if pid < 0 {
-            // Fork failed - return the error
-            return Err(std::io::Error::last_os_error().into());
-        }
+    let pid = namespace::fork_into_pid_namespace()?;
 
-        // What's happening:
-        // 1. Parent (child() PID 1) waits for child (PID 2) to complete all container setup
-        // 2. WIFEXITED(status) checks if child exited normally
-        // 3. WEXITSTATUS(status) extracts the exit code
-        // 4. Parent exits with same code as child (propagates errors)
-        if pid > 0 {
-            // Parent: wait for child to complete all container setup and execution
-            let mut status: i32 = 0;
-            libc::waitpid(pid, &mut status, 0); // Block until child exits
-
-            // Exit with the same status as the child to propagate exit codes
-            std::process::exit(if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status) // Normal exit - use child's exit code
-            } else {
-                1 // Abnormal exit (signal, etc.) - exit with error
-            });
-        }
-
-        // Child continues here - NOW we're truly PID 1 in the new namespace!
-        // This forked child process can now properly set up the container environment
-        println!("After fork, PID is now: {}", std::process::id());
+    if pid > 0 {
+        // Parent: wait for child to complete all container setup and execution
+        let exit_code = namespace::wait_for_child(pid);
+        std::process::exit(exit_code);
     }
 
-    // This function runs inside the new UTS and mount namespaces created by run()
-    // It sets up an isolated container environment with its own hostname and filesystem root
-    unsafe {
-        // Step 1: Make all mounts in this namespace private FIRST
-        // MS_PRIVATE prevents mount/unmount events from propagating to other namespaces
-        // This MUST be done before any other mounts to prevent leaking to the host
-        // MS_REC applies recursively to all mount points in the namespace
-        let result = libc::mount(
-            ptr::null(),
-            b"/\0".as_ptr() as *const libc::c_char,
-            ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            ptr::null(),
-        );
-        check_libc_result(result, "mount (private)")?;
+    // Child continues here - NOW we're truly PID 1 in the new namespace!
+    println!("After fork, PID is now: {}", std::process::id());
 
-        // Step 2: Set a custom hostname for this container
-        // This only affects the UTS namespace, not the host system
-        let hostname = b"container\0";
-        let result =
-            libc::sethostname(hostname.as_ptr() as *const libc::c_char, hostname.len() - 1);
-        check_libc_result(result, "sethostname")?;
+    // Add this process (the actual worker) to the cgroup
+    let child_pid = std::process::id();
+    let cgroup_name =
+        std::env::var("CGROUP_NAME").expect("CGROUP_NAME environment variable not set");
 
-        // Step 3: Prepare for pivot_root by bind mounting the new root onto itself
-        // This is required because pivot_root needs the new_root to be a mount point
-        // MS_BIND creates a bind mount, MS_REC makes it recursive for all subdirectories
-        // Now that we've set MS_PRIVATE, this mount won't propagate to the host
-        let result = libc::mount(
-            b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char,
-            b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char,
-            b"\0".as_ptr() as *const libc::c_char,
-            libc::MS_BIND | libc::MS_REC,
-            ptr::null() as *const libc::c_void,
-        );
-        check_libc_result(result, "mount (bind rootfs)")?;
+    // Reuse the existing cgroup
+    let cgroup = Cgroup::new(&cgroup_name);
+    cgroup
+        .add_process_cgroup(child_pid)
+        .expect("Failed to add process to cgroup");
+    println!("Added PID {} to cgroup {}", child_pid, cgroup_name);
 
-        // Step 4: Create a directory to temporarily hold the old root filesystem
-        // After pivot_root, the old root will be moved here so we can unmount it
-        let result = libc::mkdir(
-            b"/home/abc/Documents/cor/rootfs/oldroot\0".as_ptr() as *const libc::c_char,
-            0o700,
-        );
-        check_libc_result(result, "mkdir (oldroot)")?;
+    // Important: Don't let the Cgroup drop here, as it would delete the cgroup directory
+    // The parent process owns the cgroup lifecycle
+    std::mem::forget(cgroup);
 
-        // Step 5: Change to the new root directory (required for pivot_root)
-        let result =
-            libc::chdir(b"/home/abc/Documents/cor/rootfs\0".as_ptr() as *const libc::c_char);
-        check_libc_result(result, "chdir (to rootfs)")?;
-
-        // Step 6: Pivot the root filesystem
-        // This swaps the root mount point: new_root becomes "/" and old "/" moves to "oldroot"
-        // Arguments are relative to current directory: "." (current dir) becomes new root
-        // and the old root gets moved to "./oldroot"
-        let result = libc::syscall(
-            libc::SYS_pivot_root,
-            b".\0".as_ptr() as *const libc::c_char,
-            b"oldroot\0".as_ptr() as *const libc::c_char,
-        ) as i32;
-        check_libc_result(result, "pivot_root")?;
-
-        // Step 7: Change to the new root directory
-        // After pivot_root, we're still in the old location, so move to the new "/"
-        let result = libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
-        check_libc_result(result, "chdir (to /)")?;
-
-        // Step 8: Mount the /proc filesystem
-        // The container needs its own /proc to see only its own processes
-        // This provides process isolation from the host system
-        let result = libc::mount(
-            b"proc\0".as_ptr() as *const libc::c_char,
-            b"/proc\0".as_ptr() as *const libc::c_char,
-            b"proc\0".as_ptr() as *const libc::c_char,
-            0,
-            ptr::null() as *const libc::c_void,
-        );
-        check_libc_result(result, "mount (proc)")?;
-
-        // Step 9: Unmount the old root filesystem
-        // MNT_DETACH performs a lazy unmount: removes from namespace immediately
-        // but cleanup happens when no longer in use
-        let result = libc::umount2(
-            b"/oldroot\0".as_ptr() as *const libc::c_char,
-            libc::MNT_DETACH,
-        );
-        check_libc_result(result, "umount2 (oldroot)")?;
-
-        // Step 10: Remove the oldroot directory now that it's unmounted
-        // This cleans up the temporary mount point we created earlier
-        let result = libc::rmdir(b"/oldroot\0".as_ptr() as *const libc::c_char);
-        check_libc_result(result, "rmdir (oldroot)")?;
-    }
-
-    // Step 11: Configure DNS resolution
-    // Write DNS configuration to /etc/resolv.conf for internet connectivity
-    let dns_config = "nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
-    std::fs::write("/etc/resolv.conf", dns_config)
-        .map_err(|e| format!("Failed to write DNS config: {}", e))?;
-    println!("DNS configuration written to /etc/resolv.conf");
+    // Set up the container environment: hostname and filesystem isolation
+    namespace::set_hostname("container")?;
+    filesystem::setup_container_filesystem("/home/abc/Documents/cor/rootfs")
+        .map_err(|e| format!("Filesystem setup failed: {}", e))?;
 
     // Step 12: Execute the user's command inside the container
     // At this point, the container environment is fully set up with:
