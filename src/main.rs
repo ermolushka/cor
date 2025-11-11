@@ -169,6 +169,11 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     filesystem::setup_container_filesystem(&merged_dir)
         .map_err(|e| format!("Filesystem setup failed: {}", e))?;
 
+    // Install zombie reaper before running user command
+    // This ensures PID 1 automatically reaps orphaned processes
+    namespace::setup_zombie_reaper()
+        .map_err(|e| format!("Failed to setup zombie reaper: {}", e))?;
+
     // Step 12: Execute the user's command inside the container
     // At this point, the container environment is fully set up with:
     // - Custom hostname, isolated root filesystem, its own /proc, and DNS configuration

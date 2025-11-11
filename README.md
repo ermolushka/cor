@@ -10,6 +10,3 @@ sudo ./target/release/cor run /bin/bash
 
 apt update && apt install -y iproute2 net-tools iputils-ping
 ```
-
-## TODO
-- implement zombie reaping for CLONE_NEWPID
