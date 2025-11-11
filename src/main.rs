@@ -6,8 +6,10 @@ mod cgroups;
 mod filesystem;
 mod namespace;
 mod network;
+mod overlayfs;
 
 use cgroups::Cgroup;
+use overlayfs::OverlayFs;
 
 /// Main entry point for the container runtime
 /// Parses command-line arguments and dispatches to run() or child() functions
@@ -41,8 +43,19 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // - within new namespace, it runs /proc/self/exe child /bin/bash
     // - which inside sets a new hostname
 
-    // Generate a unique cgroup name based on timestamp to avoid conflicts
-    let cgroup_name = format!("mycontainer-{}", std::process::id());
+    // Generate a unique container ID for both cgroup and overlay filesystem
+    let container_id = format!("mycontainer-{}", std::process::id());
+    let cgroup_name = container_id.clone();
+
+    // Set up OverlayFS before spawning the child process
+    let overlay = OverlayFs::new(
+        &container_id,
+        "/home/abc/Documents/cor/rootfs",
+        "/home/abc/Documents/cor/containers",
+    );
+    overlay
+        .setup()
+        .map_err(|e| format!("OverlayFS setup failed: {}", e))?;
 
     unsafe {
         // Execute /proc/self/exe (this same binary) with "child" argument
@@ -51,6 +64,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .arg("child")
             .args(args)
             .env("CGROUP_NAME", &cgroup_name)
+            .env("OVERLAY_MERGED", &overlay.merged_dir)
             .pre_exec(|| namespace::create_namespaces())
             .spawn() // spawn the child process and get its PID
             .map_err(|e| format!("Failed to spawn child: {}", e))?;
@@ -87,6 +101,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         child_process
             .wait()
             .map_err(|e| format!("Failed to wait for child: {}", e))?;
+
+        // Clean up the OverlayFS after container exits
+        overlay
+            .teardown()
+            .map_err(|e| format!("OverlayFS cleanup failed: {}", e))?;
     }
 
     Ok(())
@@ -142,7 +161,12 @@ fn child(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up the container environment: hostname and filesystem isolation
     namespace::set_hostname("container")?;
-    filesystem::setup_container_filesystem("/home/abc/Documents/cor/rootfs")
+
+    // Get the overlay merged directory from environment variable
+    let merged_dir =
+        std::env::var("OVERLAY_MERGED").expect("OVERLAY_MERGED environment variable not set");
+
+    filesystem::setup_container_filesystem(&merged_dir)
         .map_err(|e| format!("Filesystem setup failed: {}", e))?;
 
     // Step 12: Execute the user's command inside the container
